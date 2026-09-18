@@ -11,7 +11,7 @@ import {
 } from 'lucide-react';
 
 export interface IncidentPanelProps {
-  activeFailures: string[];
+  activeFailures: Array<{ incident_id: string; service: string; scenario: string }>;
   isLoading: boolean;
   onInjectPayment: () => void;
   onInjectDatabase: () => void;
@@ -33,9 +33,15 @@ export const IncidentPanel: React.FC<IncidentPanelProps> = ({
   const isMaxFailures = failureCount >= 2;
   const isHealthy = failureCount === 0;
 
-  const hasPayment = activeFailures.includes('payment_failure');
-  const hasDb = activeFailures.includes('database_latency');
-  const hasNotif = activeFailures.includes('notification_failure');
+  const hasPayment = activeFailures.some(
+    (f) => f.scenario.includes('payment') || f.service === 'payment-service'
+  );
+  const hasDb = activeFailures.some(
+    (f) => f.scenario.includes('database') || f.service === 'database'
+  );
+  const hasNotif = activeFailures.some(
+    (f) => f.scenario.includes('notification') || f.service === 'notification-service'
+  );
 
   return (
     <div className="incident-panel card">
@@ -59,11 +65,11 @@ export const IncidentPanel: React.FC<IncidentPanelProps> = ({
 
       <p className="panel-description">
         Inject real-world cascading failure scenarios into the microservice dependency topology.
-        The system supports up to <strong>two concurrent failure injections</strong> to evaluate
+        The backend engine supports up to <strong>two concurrent failure injections</strong> to evaluate
         multi-component causal isolation.
       </p>
 
-      {/* Concurrent Failure Notice */}
+      {/* Dual Failure Notice */}
       {failureCount === 2 && (
         <div className="dual-failure-banner">
           <AlertOctagon className="w-5 h-5 text-amber-400 shrink-0" />
@@ -72,7 +78,7 @@ export const IncidentPanel: React.FC<IncidentPanelProps> = ({
               Dual Failure Injection Active
             </strong>
             <span className="text-slate-300">
-              Two concurrent failures are active. The RCA engine will analyze independent failure
+              Two concurrent failures are active. The backend RCA engine analyzes independent failure
               propagation paths without falsely conflating unrelated cascades.
             </span>
           </div>
@@ -86,7 +92,7 @@ export const IncidentPanel: React.FC<IncidentPanelProps> = ({
           onClick={onInjectPayment}
           disabled={isLoading || (!hasPayment && isMaxFailures)}
           className={`btn-injection btn-payment ${hasPayment ? 'active' : ''}`}
-          title="Simulate Scenario 1: payment-service -> order-service -> api-gateway"
+          title="Simulate Scenario 1: payment-service → order-service → api-gateway"
         >
           <div className="btn-icon-wrapper">
             <Flame className="w-5 h-5 text-rose-400" />
@@ -97,7 +103,7 @@ export const IncidentPanel: React.FC<IncidentPanelProps> = ({
               {hasPayment && <span className="status-badge-active">ACTIVE</span>}
             </div>
             <span className="btn-subtitle">
-              payment-service ➔ order-service ➔ api-gateway
+              payment-service → order-service → api-gateway
             </span>
           </div>
         </button>
@@ -107,7 +113,7 @@ export const IncidentPanel: React.FC<IncidentPanelProps> = ({
           onClick={onInjectDatabase}
           disabled={isLoading || (!hasDb && isMaxFailures)}
           className={`btn-injection btn-database ${hasDb ? 'active' : ''}`}
-          title="Simulate Scenario 2: database latency -> payment -> order -> gateway"
+          title="Simulate Scenario 2: database latency → payment → order → api-gateway"
         >
           <div className="btn-icon-wrapper">
             <Clock className="w-5 h-5 text-amber-400" />
@@ -118,7 +124,7 @@ export const IncidentPanel: React.FC<IncidentPanelProps> = ({
               {hasDb && <span className="status-badge-active">ACTIVE</span>}
             </div>
             <span className="btn-subtitle">
-              database (3200ms) ➔ payment ➔ order ➔ api-gateway
+              database (2850ms) → payment → order → api-gateway
             </span>
           </div>
         </button>
@@ -156,14 +162,16 @@ export const IncidentPanel: React.FC<IncidentPanelProps> = ({
           ) : (
             <div className="flex items-center gap-2 text-rose-400 text-sm font-medium">
               <Sparkles className="w-4 h-4 text-amber-400 animate-pulse" />
-              <span>Anomalies Detected: {activeFailures.join(', ')}</span>
+              <span>
+                Anomalies Injected: {activeFailures.map((f) => f.service).join(', ')}
+              </span>
             </div>
           )}
         </div>
 
         <button
           onClick={onReset}
-          disabled={isLoading || isHealthy}
+          disabled={isLoading && isHealthy}
           className="btn-reset"
           title="Reset telemetry and restore all services to healthy state"
         >

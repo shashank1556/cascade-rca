@@ -12,13 +12,13 @@ import type { RCAResult as RCAResultType } from '../api';
 export interface RCAResultProps {
   rca: RCAResultType | null;
   isLoading: boolean;
-  activeFailures: string[];
+  independentServices?: string[];
 }
 
 export const RCAResult: React.FC<RCAResultProps> = ({
   rca,
   isLoading,
-  activeFailures,
+  independentServices = [],
 }) => {
   if (isLoading) {
     return (
@@ -32,7 +32,7 @@ export const RCAResult: React.FC<RCAResultProps> = ({
     );
   }
 
-  if (!rca || activeFailures.length === 0) {
+  if (!rca) {
     return (
       <div className="rca-card card empty-state">
         <div className="flex flex-col items-center justify-center p-8 text-center">
@@ -52,10 +52,6 @@ export const RCAResult: React.FC<RCAResultProps> = ({
   }
 
   const confidencePct = Math.round(rca.root_cause.confidence * 100);
-  const isDualFailure = activeFailures.length === 2;
-  const hasNotif = activeFailures.includes('notification_failure');
-  const hasPayment = activeFailures.includes('payment_failure');
-  const hasDb = activeFailures.includes('database_latency');
 
   return (
     <div className="rca-card card">
@@ -78,13 +74,13 @@ export const RCAResult: React.FC<RCAResultProps> = ({
       {/* Primary Root Cause Hero Box */}
       <div className="root-cause-hero">
         <div className="root-cause-info">
-          <span className="hero-label">PROVEN ROOT ORIGIN</span>
+          <span className="hero-label">IDENTIFIED ROOT CAUSE</span>
           <div className="service-name-row">
             <h2 className="root-service-title">{rca.root_cause.service}</h2>
-            <span className="causal-tag">Authoritative Origin</span>
+            <span className="causal-tag">RCA Engine Result</span>
           </div>
           <p className="hero-subtext">
-            Identified via temporal onset, graph depth, and downstream backpropagation.
+            Determined by backend causal backpropagation and temporal onset analysis.
           </p>
         </div>
 
@@ -109,25 +105,23 @@ export const RCAResult: React.FC<RCAResultProps> = ({
           </div>
           <div className="confidence-label-text">
             <TrendingUp className="w-3.5 h-3.5 text-emerald-400 inline mr-1" />
-            <span>Causal Weight</span>
+            <span>Causal Score ({confidencePct}%)</span>
           </div>
         </div>
       </div>
 
-      {/* Dual Concurrent Failure Callout (When Applicable) */}
-      {isDualFailure && hasNotif && (hasPayment || hasDb) && (
+      {/* Independent Failure Callout (When backend reports concurrent independent faults) */}
+      {independentServices.length > 0 && (
         <div className="independent-failure-callout">
           <div className="flex items-start gap-2.5">
             <Info className="w-5 h-5 text-purple-400 shrink-0 mt-0.5" />
             <div>
               <strong className="text-purple-300 font-semibold block text-sm">
-                Independent Failure Discovered: notification-service
+                Concurrent Independent Fault: {independentServices.join(', ')}
               </strong>
               <p className="text-xs text-slate-300 mt-1 leading-relaxed">
-                The RCA engine successfully distinguished between the primary cascade origin (
-                <strong className="text-rose-300">{rca.root_cause.service}</strong>) and the concurrent
-                isolated failure in <strong className="text-purple-300">notification-service</strong>.
-                Notification errors did not originate from nor cause the payment checkout cascade.
+                Backend state indicates independent failure activity occurring concurrently with the
+                primary cascade. The causal analysis keeps these failure boundaries isolated.
               </p>
             </div>
           </div>
@@ -144,35 +138,27 @@ export const RCAResult: React.FC<RCAResultProps> = ({
         ) : (
           <div className="affected-services-flow">
             <span className="service-pill root">{rca.root_cause.service}</span>
-            {rca.affected_services
-              .filter((svc) => svc !== 'notification-service')
-              .map((svc) => (
-                <React.Fragment key={svc}>
-                  <ArrowRight className="w-3.5 h-3.5 text-rose-400 shrink-0" />
-                  <span className="service-pill affected">{svc}</span>
-                </React.Fragment>
-              ))}
-            {isDualFailure && hasNotif && (
-              <span className="service-pill independent-badge ml-auto">
-                + notification-service (Independent)
-              </span>
-            )}
+            {rca.affected_services.map((svc) => (
+              <React.Fragment key={svc}>
+                <ArrowRight className="w-3.5 h-3.5 text-rose-400 shrink-0" />
+                <span className="service-pill affected">{svc}</span>
+              </React.Fragment>
+            ))}
           </div>
         )}
       </div>
 
-      {/* Gemini AI / Deterministic Explanation */}
+      {/* Gemini Narration Layer / Causal Explanation */}
       <div className="section-block explanation-box">
         <div className="flex items-center justify-between mb-2">
           <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-300 uppercase tracking-wider">
             <Sparkles className="w-3.5 h-3.5 text-amber-400" />
             <span>Causal Explanation</span>
           </div>
-          <span className="engine-source-pill">Gemini Narration Layer</span>
+          <span className="engine-source-pill">Gemini Narration</span>
         </div>
         <p className="explanation-text">
-          {rca.explanation ||
-            'Root-cause analysis concluded successfully. Check downstream dependencies and correlated commits.'}
+          {rca.explanation || 'Explanation unavailable.'}
         </p>
       </div>
     </div>

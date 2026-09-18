@@ -12,11 +12,13 @@ import {
 import type { ServiceName } from '../api';
 
 export interface ServiceGraphProps {
-  activeFailures: string[];
   rootCauseService: string | null;
   affectedServices: string[];
+  independentServices: string[];
+  propagationEdges: Array<{ from: string; to: string }>;
   selectedService: string | null;
   onSelectService: (service: string) => void;
+  activeFailuresCount: number;
 }
 
 interface NodeLayout {
@@ -114,44 +116,46 @@ const EDGES: EdgeLayout[] = [
 ];
 
 export const ServiceGraph: React.FC<ServiceGraphProps> = ({
-  activeFailures,
   rootCauseService,
   affectedServices,
+  independentServices,
+  propagationEdges,
   selectedService,
   onSelectService,
+  activeFailuresCount,
 }) => {
-  const getNodeState = (serviceId: ServiceName) => {
-    const hasPayment = activeFailures.includes('payment_failure');
-    const hasDb = activeFailures.includes('database_latency');
-    const hasNotif = activeFailures.includes('notification_failure');
-
-    // Dual failure: notification-service is independent failure if active while another failure is also active
-    if (serviceId === 'notification-service' && hasNotif) {
-      if (hasPayment || hasDb) {
-        return 'independent-failure';
-      }
+  // Purely derives node state from backend state props
+  const getNodeState = (serviceId: ServiceName): 'healthy' | 'root-cause' | 'affected' | 'independent-failure' => {
+    if (serviceId === rootCauseService) {
       return 'root-cause';
     }
-
-    if (rootCauseService === serviceId) {
-      return 'root-cause';
+    if (independentServices.includes(serviceId)) {
+      return 'independent-failure';
     }
-
     if (affectedServices.includes(serviceId)) {
       return 'affected';
     }
-
     return 'healthy';
   };
 
+  // Edge cascade state reflects backend propagation events or failing edge status
   const isEdgeInCascade = (from: ServiceName, to: ServiceName): boolean => {
+    // 1. Check if backend emitted this edge in cascade_propagation or /graph
+    const matchedBackendPropagation = propagationEdges.some(
+      (e) => (e.from === from && e.to === to) || (e.from === to && e.to === from)
+    );
+    if (matchedBackendPropagation) {
+      return true;
+    }
+
+    // 2. Check if both endpoints are active in the primary cascade chain
     const fromState = getNodeState(from);
     const toState = getNodeState(to);
-
     if (
-      (fromState === 'affected' || fromState === 'root-cause') &&
-      (toState === 'affected' || toState === 'root-cause')
+      (fromState === 'root-cause' || fromState === 'affected') &&
+      (toState === 'root-cause' || toState === 'affected')
     ) {
+      // Notification-service is isolated; never connect it to payment cascade
       if (
         (from === 'order-service' && to === 'notification-service') ||
         (to === 'order-service' && from === 'notification-service')
@@ -160,6 +164,7 @@ export const ServiceGraph: React.FC<ServiceGraphProps> = ({
       }
       return true;
     }
+
     return false;
   };
 
@@ -184,15 +189,15 @@ export const ServiceGraph: React.FC<ServiceGraphProps> = ({
           </div>
           <div className="legend-item">
             <span className="legend-dot root-cause"></span>
-            <span>Causal Root Origin</span>
+            <span>Identified Root Cause</span>
           </div>
           <div className="legend-item">
             <span className="legend-dot affected"></span>
-            <span>Cascaded Error (500/502/504)</span>
+            <span>Cascaded Error</span>
           </div>
           <div className="legend-item">
             <span className="legend-dot independent"></span>
-            <span>Independent Failure (Concurrent)</span>
+            <span>Independent Failure</span>
           </div>
         </div>
       </div>
@@ -358,11 +363,11 @@ export const ServiceGraph: React.FC<ServiceGraphProps> = ({
                     {node.role}
                   </text>
 
-                  {/* State Badge */}
+                  {/* State Badge with clean UTF-8 */}
                   <g transform="translate(10, 48)">
                     {state === 'healthy' && (
                       <text x="0" y="8" className="badge-text healthy">
-                        ● 200 OK • Healthy
+                        • 200 OK • Healthy
                       </text>
                     )}
                     {state === 'root-cause' && (
@@ -396,17 +401,17 @@ export const ServiceGraph: React.FC<ServiceGraphProps> = ({
         <div className="info-stat">
           <span className="text-slate-400">Propagation Direction:</span>
           <strong className="text-slate-200">
-            {rootCauseService ? `${rootCauseService} ➔ Callers` : 'Normal Operations'}
+            {rootCauseService ? `${rootCauseService} → Callers` : 'Normal Operations'}
           </strong>
         </div>
         <div className="info-stat">
           <span className="text-slate-400">Active Failure Components:</span>
           <strong className="text-indigo-300">
-            {activeFailures.length === 0
+            {activeFailuresCount === 0
               ? 'None (Healthy)'
-              : activeFailures.length === 1
-              ? `1 (${activeFailures[0]})`
-              : `2 Simultaneous (${activeFailures.join(' + ')})`}
+              : activeFailuresCount === 1
+              ? '1 Failure Active'
+              : '2 Simultaneous Failures'}
           </strong>
         </div>
       </div>

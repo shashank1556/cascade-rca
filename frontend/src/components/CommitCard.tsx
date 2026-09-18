@@ -19,7 +19,7 @@ export const CommitCard: React.FC<CommitCardProps> = ({ commit, rootCauseService
         </div>
         <div className="p-4 text-center">
           <p className="text-xs text-slate-400 italic">
-            No correlated commit detected for this incident, or GitHub API unavailable.
+            No relevant commit correlated with this incident.
           </p>
         </div>
       </div>
@@ -66,7 +66,7 @@ export const CommitCard: React.FC<CommitCardProps> = ({ commit, rootCauseService
           </div>
           <div className="flex items-center gap-1 text-emerald-400">
             <ShieldCheck className="w-3.5 h-3.5" />
-            <span>Direct correlation detected</span>
+            <span>Recent change correlated</span>
           </div>
         </div>
       </div>

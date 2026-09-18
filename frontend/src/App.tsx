@@ -1,28 +1,40 @@
-import React, { useState, useEffect } from 'react';
-import { Activity } from 'lucide-react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { Activity, AlertCircle, Wifi, WifiOff } from 'lucide-react';
 import { ServiceGraph } from './components/ServiceGraph';
 import { IncidentPanel } from './components/IncidentPanel';
 import { RCAResult } from './components/RCAResult';
 import { Timeline } from './components/Timeline';
 import { CommitCard } from './components/CommitCard';
-import type { RCAResult as RCAResultType } from './api';
+import type {
+  RCAResult as RCAResultType,
+  SSEActiveFailure,
+  SSEEventEnvelope,
+} from './api';
 import {
+  API_BASE,
   simulatePaymentFailure,
   simulateDatabaseLatency,
   simulateNotificationFailure,
   resetSimulation,
   getRCAResult,
-  getMockRCAResult,
+  getGraph,
+  checkBackendHealth,
 } from './api';
 
 export const App: React.FC = () => {
-  // Application starts in a HEALTHY state
-  const [activeFailures, setActiveFailures] = useState<string[]>([]);
+  // State directly synchronized with backend
   const [incidentId, setIncidentId] = useState<string | null>(null);
   const [rca, setRca] = useState<RCAResultType | null>(null);
+  const [activeFailures, setActiveFailures] = useState<SSEActiveFailure[]>([]);
+  const [propagationEdges, setPropagationEdges] = useState<Array<{ from: string; to: string }>>([]);
+  const [connectionStatus, setConnectionStatus] = useState<'connected' | 'reconnecting' | 'offline'>('reconnecting');
   const [isLoading, setIsLoading] = useState<boolean>(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [selectedService, setSelectedService] = useState<string | null>(null);
   const [currentTime, setCurrentTime] = useState<string>('');
+
+  const eventSourceRef = useRef<EventSource | null>(null);
+  const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Live UTC Clock
   useEffect(() => {
@@ -35,53 +47,208 @@ export const App: React.FC = () => {
     return () => clearInterval(timer);
   }, []);
 
-  // Update RCA result when activeFailures change
-  const refreshRCA = async (failures: string[], incId: string | null) => {
-    if (failures.length === 0) {
-      setRca(null);
-      return;
-    }
-    setIsLoading(true);
+  // Sync initial graph & state on mount
+  const syncInitialState = useCallback(async () => {
     try {
-      const targetId = incId || 'INC-001';
-      // Attempt backend API, with fallback to deterministic mock contract
-      const result = await getRCAResult(targetId);
-      // Ensure multi-failure state is accurately reflected
-      if (failures.length > 0 && (!result || result.root_cause.confidence === 0)) {
-        setRca(getMockRCAResult(targetId, failures));
-      } else {
-        // If backend returned single-failure RCA but we have dual failures, enrich with dual failure representation
-        if (failures.length === 2 && failures.includes('notification_failure')) {
-          setRca(getMockRCAResult(targetId, failures));
-        } else {
-          setRca(result);
-        }
+      const isHealthy = await checkBackendHealth();
+      if (!isHealthy) {
+        setConnectionStatus('offline');
+        return;
       }
+      const graphData = await getGraph();
+      const failingEdges = graphData.edges
+        .filter((e) => e.status === 'failing')
+        .map((e) => ({ from: e.source, to: e.target }));
+      setPropagationEdges(failingEdges);
     } catch {
-      setRca(getMockRCAResult(incId || 'INC-001', failures));
-    } finally {
-      setIsLoading(false);
+      // Backend may be starting
+    }
+  }, []);
+
+  useEffect(() => {
+    syncInitialState();
+  }, [syncInitialState]);
+
+  // Real Server-Sent Events (SSE) integration
+  useEffect(() => {
+    let isSubscribed = true;
+
+    const connectSSE = () => {
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close();
+        eventSourceRef.current = null;
+      }
+
+      setConnectionStatus('reconnecting');
+      const es = new EventSource(`${API_BASE}/events`);
+      eventSourceRef.current = es;
+
+      es.onopen = () => {
+        if (!isSubscribed) return;
+        setConnectionStatus('connected');
+        setErrorMessage(null);
+      };
+
+      // Handle custom SSE event types emitted by backend streaming_manager
+      es.addEventListener('connected', (event: MessageEvent) => {
+        if (!isSubscribed) return;
+        try {
+          const envelope: SSEEventEnvelope<{ message: string }> = JSON.parse(event.data);
+          if (envelope.active_failures) {
+            setActiveFailures(envelope.active_failures);
+          }
+        } catch {
+          // Ignore JSON parse errors on ping
+        }
+      });
+
+      es.addEventListener('heartbeat', (event: MessageEvent) => {
+        if (!isSubscribed) return;
+        try {
+          const envelope: SSEEventEnvelope = JSON.parse(event.data);
+          if (envelope.active_failures) {
+            setActiveFailures(envelope.active_failures);
+          }
+        } catch {
+          // Ignore heartbeat parse
+        }
+      });
+
+      es.addEventListener('failure_injection', (event: MessageEvent) => {
+        if (!isSubscribed) return;
+        try {
+          const envelope: SSEEventEnvelope<{ incident_id: string; service: string; scenario: string }> =
+            JSON.parse(event.data);
+          if (envelope.active_failures) {
+            setActiveFailures(envelope.active_failures);
+          }
+          if (envelope.data?.incident_id) {
+            setIncidentId(envelope.data.incident_id);
+          }
+        } catch {
+          // Ignore malformed event
+        }
+      });
+
+      es.addEventListener('service_state', (event: MessageEvent) => {
+        if (!isSubscribed) return;
+        try {
+          const envelope: SSEEventEnvelope<{
+            service?: string;
+            status?: string;
+            all_services?: boolean;
+          }> = JSON.parse(event.data);
+
+          if (envelope.data?.all_services && envelope.data?.status === 'healthy') {
+            setActiveFailures([]);
+            setPropagationEdges([]);
+            setRca(null);
+            setIncidentId(null);
+          }
+          if (envelope.active_failures) {
+            setActiveFailures(envelope.active_failures);
+          }
+        } catch {
+          // Ignore parse error
+        }
+      });
+
+      es.addEventListener('cascade_propagation', (event: MessageEvent) => {
+        if (!isSubscribed) return;
+        try {
+          const envelope: SSEEventEnvelope<{ from_service: string; to_service: string; hop: number }> =
+            JSON.parse(event.data);
+          if (envelope.data?.from_service && envelope.data?.to_service) {
+            setPropagationEdges((prev) => {
+              const next = [...prev, { from: envelope.data.from_service, to: envelope.data.to_service }];
+              // Deduplicate
+              return next.filter(
+                (e, i, arr) =>
+                  arr.findIndex((x) => x.from === e.from && x.to === e.to) === i
+              );
+            });
+          }
+          if (envelope.active_failures) {
+            setActiveFailures(envelope.active_failures);
+          }
+        } catch {
+          // Ignore parse error
+        }
+      });
+
+      es.addEventListener('rca_result', (event: MessageEvent) => {
+        if (!isSubscribed) return;
+        try {
+          const envelope: SSEEventEnvelope<RCAResultType> = JSON.parse(event.data);
+          // Backend broadcasts either full envelope or raw RCAResult payload
+          const resultData: RCAResultType =
+            (envelope.data && 'root_cause' in envelope.data)
+              ? envelope.data
+              : (envelope as unknown as RCAResultType);
+
+          if (resultData && resultData.root_cause) {
+            setRca(resultData);
+            if (resultData.incident_id) {
+              setIncidentId(resultData.incident_id);
+            }
+          }
+          if (envelope.active_failures) {
+            setActiveFailures(envelope.active_failures);
+          }
+        } catch {
+          // Ignore parse error
+        }
+      });
+
+      es.onerror = () => {
+        if (!isSubscribed) return;
+        setConnectionStatus('reconnecting');
+        es.close();
+        // Exponential backoff / graceful reconnection
+        reconnectTimeoutRef.current = setTimeout(() => {
+          if (isSubscribed) connectSSE();
+        }, 3000);
+      };
+    };
+
+    connectSSE();
+
+    return () => {
+      isSubscribed = false;
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current);
+      }
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close();
+        eventSourceRef.current = null;
+      }
+    };
+  }, []);
+
+  // Trigger RCA retrieval after simulation to ensure result renders promptly
+  const fetchAuthoritativeRCA = async (incId: string) => {
+    try {
+      const result = await getRCAResult(incId);
+      setRca(result);
+      setErrorMessage(null);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Unable to retrieve RCA result.';
+      setErrorMessage(msg);
     }
   };
 
   // Scenario 1: Payment Failure
   const handleInjectPayment = async () => {
-    if (activeFailures.includes('payment_failure')) return;
     if (activeFailures.length >= 2) return;
-
     setIsLoading(true);
-    const newFailures = [...activeFailures, 'payment_failure'];
-    setActiveFailures(newFailures);
-
+    setErrorMessage(null);
     try {
       const resp = await simulatePaymentFailure();
-      const currentIncId = resp.incident_id || incidentId || 'INC-001';
-      setIncidentId(currentIncId);
-      await refreshRCA(newFailures, currentIncId);
-    } catch {
-      const currentIncId = incidentId || 'INC-001';
-      setIncidentId(currentIncId);
-      setRca(getMockRCAResult(currentIncId, newFailures));
+      setIncidentId(resp.incident_id);
+      // Backend automatically broadcasts SSE events; also fetch authoritative RCA
+      await fetchAuthoritativeRCA(resp.incident_id);
+    } catch (err: unknown) {
+      setErrorMessage(err instanceof Error ? err.message : 'Backend unavailable');
     } finally {
       setIsLoading(false);
     }
@@ -89,22 +256,15 @@ export const App: React.FC = () => {
 
   // Scenario 2: Database Latency
   const handleInjectDatabase = async () => {
-    if (activeFailures.includes('database_latency')) return;
     if (activeFailures.length >= 2) return;
-
     setIsLoading(true);
-    const newFailures = [...activeFailures, 'database_latency'];
-    setActiveFailures(newFailures);
-
+    setErrorMessage(null);
     try {
       const resp = await simulateDatabaseLatency();
-      const currentIncId = resp.incident_id || incidentId || 'INC-002';
-      setIncidentId(currentIncId);
-      await refreshRCA(newFailures, currentIncId);
-    } catch {
-      const currentIncId = incidentId || 'INC-002';
-      setIncidentId(currentIncId);
-      setRca(getMockRCAResult(currentIncId, newFailures));
+      setIncidentId(resp.incident_id);
+      await fetchAuthoritativeRCA(resp.incident_id);
+    } catch (err: unknown) {
+      setErrorMessage(err instanceof Error ? err.message : 'Backend unavailable');
     } finally {
       setIsLoading(false);
     }
@@ -112,22 +272,15 @@ export const App: React.FC = () => {
 
   // Scenario 3: Notification Failure
   const handleInjectNotification = async () => {
-    if (activeFailures.includes('notification_failure')) return;
     if (activeFailures.length >= 2) return;
-
     setIsLoading(true);
-    const newFailures = [...activeFailures, 'notification_failure'];
-    setActiveFailures(newFailures);
-
+    setErrorMessage(null);
     try {
       const resp = await simulateNotificationFailure();
-      const currentIncId = resp.incident_id || incidentId || 'INC-003';
-      setIncidentId(currentIncId);
-      await refreshRCA(newFailures, currentIncId);
-    } catch {
-      const currentIncId = incidentId || 'INC-003';
-      setIncidentId(currentIncId);
-      setRca(getMockRCAResult(currentIncId, newFailures));
+      setIncidentId(resp.incident_id);
+      await fetchAuthoritativeRCA(resp.incident_id);
+    } catch (err: unknown) {
+      setErrorMessage(err instanceof Error ? err.message : 'Backend unavailable');
     } finally {
       setIsLoading(false);
     }
@@ -136,15 +289,17 @@ export const App: React.FC = () => {
   // Reset to clean healthy baseline
   const handleReset = async () => {
     setIsLoading(true);
+    setErrorMessage(null);
     try {
       await resetSimulation();
-    } catch {
-      // Offline fallback
-    } finally {
       setActiveFailures([]);
       setIncidentId(null);
       setRca(null);
+      setPropagationEdges([]);
       setSelectedService(null);
+    } catch (err: unknown) {
+      setErrorMessage(err instanceof Error ? err.message : 'Backend unavailable');
+    } finally {
       setIsLoading(false);
     }
   };
@@ -157,6 +312,11 @@ export const App: React.FC = () => {
   };
 
   const systemStatus = getSystemStatus();
+
+  // Identify any active failure service that is NOT the primary root cause or in affected_services
+  const independentServices = activeFailures
+    .map((f) => f.service)
+    .filter((svc) => svc !== rca?.root_cause.service && !rca?.affected_services.includes(svc));
 
   return (
     <div className="app-container">
@@ -178,6 +338,29 @@ export const App: React.FC = () => {
         </div>
 
         <div className="header-right">
+          {/* Real-time SSE Connection Status */}
+          <div className="header-stat-box">
+            <span className="stat-label">STREAM CONNECTION</span>
+            <div className="flex items-center gap-1.5">
+              {connectionStatus === 'connected' ? (
+                <>
+                  <Wifi className="w-3.5 h-3.5 text-emerald-400" />
+                  <strong className="text-xs text-emerald-400">SSE Connected</strong>
+                </>
+              ) : connectionStatus === 'reconnecting' ? (
+                <>
+                  <Wifi className="w-3.5 h-3.5 text-amber-400 animate-pulse" />
+                  <strong className="text-xs text-amber-400">SSE Reconnecting</strong>
+                </>
+              ) : (
+                <>
+                  <WifiOff className="w-3.5 h-3.5 text-rose-400" />
+                  <strong className="text-xs text-rose-400">Backend Offline</strong>
+                </>
+              )}
+            </div>
+          </div>
+
           <div className="header-stat-box">
             <span className="stat-label">SYSTEM HEALTH</span>
             <div className="flex items-center gap-1.5">
@@ -200,6 +383,22 @@ export const App: React.FC = () => {
         </div>
       </header>
 
+      {/* Error notification banner if API fails */}
+      {errorMessage && (
+        <div className="api-error-banner flex items-center justify-between p-3 mb-4 rounded bg-rose-950/40 border border-rose-500/50 text-rose-200 text-sm">
+          <div className="flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+            <span>{errorMessage}</span>
+          </div>
+          <button
+            onClick={() => setErrorMessage(null)}
+            className="text-xs text-rose-400 hover:text-white underline ml-4"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
       {/* Main Dashboard Layout */}
       <main className="dashboard-grid">
         {/* Left Column: Topology & Failure Controls */}
@@ -217,11 +416,13 @@ export const App: React.FC = () => {
 
           {/* Microservice Dependency Topology */}
           <ServiceGraph
-            activeFailures={activeFailures}
             rootCauseService={rca?.root_cause.service || null}
             affectedServices={rca?.affected_services || []}
+            independentServices={independentServices}
+            propagationEdges={propagationEdges}
             selectedService={selectedService}
             onSelectService={setSelectedService}
+            activeFailuresCount={activeFailures.length}
           />
         </section>
 
@@ -231,7 +432,7 @@ export const App: React.FC = () => {
           <RCAResult
             rca={rca}
             isLoading={isLoading}
-            activeFailures={activeFailures}
+            independentServices={independentServices}
           />
 
           {/* GitHub Commit Correlation */}
@@ -244,6 +445,7 @@ export const App: React.FC = () => {
           <Timeline
             timeline={rca?.timeline || []}
             rootCauseService={rca?.root_cause.service || null}
+            independentServices={independentServices}
           />
         </section>
       </main>
