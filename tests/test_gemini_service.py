@@ -132,3 +132,31 @@ def test_dual_simultaneous_failure_explanation():
         assert "notification-service" in explanation
         assert "independent" in explanation.lower() or "isolated" in explanation.lower()
         assert "order-service" in explanation
+
+
+def test_gemini_dictionary_input():
+    """Verify generate_explanation handles Dict[str, Any] input as provided by rca_engine.py."""
+    evidence_payload = {
+        "incident_id": "INC-001",
+        "root_cause": {"service": "payment-service", "confidence": 0.91},
+        "affected_services": ["order-service", "api-gateway"],
+        "timeline": [
+            {"timestamp": "2026-09-18T10:00:01Z", "service": "payment-service", "event": "Error spike"},
+            {"timestamp": "2026-09-18T10:00:02Z", "service": "order-service", "event": "Failed call"},
+        ],
+        "commit": {
+            "sha": "a8f3b1c",
+            "message": "fix(payment): timeout threshold",
+            "author": "alex.dev@echelon.io",
+            "url": "https://github.com/...",
+        },
+        "independent_failures": [{"service": "notification-service"}],
+    }
+
+    with patch.dict("os.environ", {}, clear=True):
+        explanation = generate_explanation(evidence_payload)
+        assert isinstance(explanation, str)
+        assert "payment-service" in explanation
+        assert "91%" in explanation
+        assert "notification-service" in explanation
+        assert "a8f3b1c" in explanation

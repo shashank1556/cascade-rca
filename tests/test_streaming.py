@@ -139,3 +139,38 @@ def test_sse_endpoint_fastapi():
     assert "text/event-stream" in response.headers["content-type"]
     assert "event: connected" in response.text
     assert "active_failures" in response.text
+
+
+def test_sse_event_payload_structure():
+    """Test SSE event payload complies strictly with expected JSON schema:
+    {
+        "event": "...",
+        "timestamp": "...",
+        "active_failures": [...],
+        "data": {...}
+    }
+    """
+    async def _run():
+        mgr = StreamingManager()
+        queue = await mgr.subscribe()
+
+        mgr.register_failure("INC-999", "payment-service", "payment-failure")
+        await mgr.broadcast("custom_event", {"metric": 42, "flag": True})
+
+        msg = await queue.get()
+        assert msg.startswith("event: custom_event\ndata: ")
+        
+        # Extract JSON from 'data: <json>\n\n'
+        data_line = [l for l in msg.split("\n") if l.startswith("data: ")][0]
+        payload = json.loads(data_line[6:])
+
+        assert payload["event"] == "custom_event"
+        assert "timestamp" in payload
+        assert isinstance(payload["active_failures"], list)
+        assert len(payload["active_failures"]) == 1
+        assert payload["active_failures"][0]["service"] == "payment-service"
+        assert payload["data"] == {"metric": 42, "flag": True}
+
+        await mgr.unsubscribe(queue)
+
+    asyncio.run(_run())

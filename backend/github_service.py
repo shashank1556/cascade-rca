@@ -1,13 +1,17 @@
-"""GitHub REST API integration for Cascade RCA. LOCKED.
+"""GitHub REST API correlation service for Cascade RCA. LOCKED.
+
+Locked public functions:
+- get_recent_commits(...)
+- get_commit_diff(...)
 
 Correlates suspected root-cause microservices with recent repository commits
 and diffs using the GitHub REST API. Gracefully degrades when GitHub is
-unavailable, unconfigured, or rate-limited.
+unavailable, unconfigured, or rate-limited. Never exposes tokens to the frontend.
 """
 
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 import httpx
 from dotenv import load_dotenv
 
@@ -20,50 +24,74 @@ logger = logging.getLogger(__name__)
 GITHUB_API_BASE = "https://api.github.com"
 
 # Realistic curated mock commits for hackathon demo scenarios when
-# GitHub API is unconfigured or unreachable.
-FALLBACK_COMMITS: Dict[str, CommitInfo] = {
-    "payment-service": CommitInfo(
-        sha="8f31c2a",
-        message="fix(payment): adjust connection pool and timeout parameters for stripe gateway",
-        url="https://github.com/shashank1556/cascade-rca/commit/8f31c2a",
-        author="alex.dev",
-    ),
-    "database": CommitInfo(
-        sha="4c91d0e",
-        message="perf(db): migration 0042 adding index on transactions table and vacuum settings",
-        url="https://github.com/shashank1556/cascade-rca/commit/4c91d0e",
-        author="data-infra",
-    ),
-    "notification-service": CommitInfo(
-        sha="7b22e11",
-        message="feat(notifications): switch email provider webhook retry policy to exponential backoff",
-        url="https://github.com/shashank1556/cascade-rca/commit/7b22e11",
-        author="sarah.m",
-    ),
-    "order-service": CommitInfo(
-        sha="3a11b9f",
-        message="refactor(order): streamline checkout fulfillment dispatch queue",
-        url="https://github.com/shashank1556/cascade-rca/commit/3a11b9f",
-        author="jordan.k",
-    ),
-    "api-gateway": CommitInfo(
-        sha="1e84c50",
-        message="chore(gateway): update ratelimit middleware route mappings",
-        url="https://github.com/shashank1556/cascade-rca/commit/1e84c50",
-        author="platform-team",
-    ),
+# GitHub API is unconfigured, unreachable, or rate-limited.
+MOCK_COMMITS: Dict[str, List[CommitInfo]] = {
+    "payment-service": [
+        CommitInfo(
+            sha="a8f3b1c",
+            message="fix(payment): update Stripe gateway timeout threshold and retry policy",
+            url="https://github.com/shashank1556/cascade-rca/commit/a8f3b1c",
+            author="alex.dev@echelon.io",
+        ),
+        CommitInfo(
+            sha="b4e2c90",
+            message="refactor(payment): migrate payment authorization handlers to v2",
+            url="https://github.com/shashank1556/cascade-rca/commit/b4e2c90",
+            author="sarah.m@echelon.io",
+        ),
+    ],
+    "database": [
+        CommitInfo(
+            sha="d7c1e54",
+            message="perf(db): modify Postgres connection pool max_connections and idle timeouts",
+            url="https://github.com/shashank1556/cascade-rca/commit/d7c1e54",
+            author="dave.dba@echelon.io",
+        ),
+        CommitInfo(
+            sha="e9a0f32",
+            message="migration: add composite index on transactions(order_id, created_at)",
+            url="https://github.com/shashank1556/cascade-rca/commit/e9a0f32",
+            author="dave.dba@echelon.io",
+        ),
+    ],
+    "notification-service": [
+        CommitInfo(
+            sha="f2b8a71",
+            message="fix(notif): update Twilio SMS delivery retry backoff queue",
+            url="https://github.com/shashank1556/cascade-rca/commit/f2b8a71",
+            author="jordan.k@echelon.io",
+        )
+    ],
+    "order-service": [
+        CommitInfo(
+            sha="c3d8e91",
+            message="feat(order): add idempotency key check on checkout requests",
+            url="https://github.com/shashank1556/cascade-rca/commit/c3d8e91",
+            author="chris.t@echelon.io",
+        )
+    ],
+    "api-gateway": [
+        CommitInfo(
+            sha="1e84c50",
+            message="chore(gateway): update ratelimit middleware route mappings",
+            url="https://github.com/shashank1556/cascade-rca/commit/1e84c50",
+            author="platform-team@echelon.io",
+        )
+    ],
 }
 
 # Service keyword mapping for intelligent commit message matching
 SERVICE_KEYWORDS: Dict[str, List[str]] = {
-    "payment-service": ["payment", "stripe", "billing", "checkout", "transaction", "pay"],
-    "database": ["db", "database", "postgres", "sql", "migration", "query", "pool"],
-    "notification-service": ["notification", "notify", "email", "sms", "push", "alert"],
+    "payment-service": ["payment", "payments", "stripe", "gateway", "transaction", "pay", "billing"],
+    "database": ["database", "db", "postgres", "sql", "query", "pool", "vacuum", "migration"],
+    "notification-service": ["notification", "notify", "email", "sms", "queue", "push", "alert"],
     "order-service": ["order", "orders", "checkout", "fulfillment"],
     "api-gateway": ["gateway", "proxy", "routing", "ingress", "ratelimit"],
     "user-service": ["user", "auth", "session", "profile"],
     "product-service": ["product", "catalog", "inventory", "item"],
 }
+
+FALLBACK_COMMITS = MOCK_COMMITS
 
 
 def _get_headers(token: Optional[str] = None) -> Dict[str, str]:
@@ -89,7 +117,7 @@ def get_recent_commits(
     """Retrieve recent commits from GitHub REST API, optionally filtered by service.
 
     Args:
-        service: Optional service name to correlate with commit messages/files.
+        service: Optional service name to correlate with commit messages/paths.
         limit: Maximum number of commits to retrieve.
         owner: GitHub repository owner (defaults to GITHUB_OWNER env var).
         repo: GitHub repository name (defaults to GITHUB_REPO env var).
@@ -97,83 +125,77 @@ def get_recent_commits(
         use_fallback: Whether to return curated mock commits if GitHub is unavailable.
 
     Returns:
-        List of CommitInfo objects matching the contract.
+        List[CommitInfo] objects matching the canonical contract.
     """
     owner = owner or os.getenv("GITHUB_OWNER")
     repo = repo or os.getenv("GITHUB_REPO")
     token = token or os.getenv("GITHUB_TOKEN")
 
-    if not owner or not repo:
-        logger.info("GitHub owner/repo not configured. Utilizing fallback commits if enabled.")
-        if use_fallback and service and service in FALLBACK_COMMITS:
-            return [FALLBACK_COMMITS[service]]
-        elif use_fallback and not service:
-            return list(FALLBACK_COMMITS.values())[:limit]
-        return []
+    if owner and repo:
+        url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/commits"
+        headers = _get_headers(token)
 
-    url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/commits"
-    headers = _get_headers(token)
+        try:
+            with httpx.Client(timeout=3.5) as client:
+                response = client.get(url, headers=headers, params={"per_page": min(limit * 2, 30)})
 
-    try:
-        with httpx.Client(timeout=4.0) as client:
-            response = client.get(url, headers=headers, params={"per_page": min(limit * 2, 30)})
+                if response.status_code == 200:
+                    commits_data = response.json()
+                    if isinstance(commits_data, list):
+                        results: List[CommitInfo] = []
+                        keywords = SERVICE_KEYWORDS.get(service, [service]) if service else []
 
-            if response.status_code != 200:
-                logger.warning(
-                    "GitHub API responded with status %d: %s",
-                    response.status_code,
-                    response.text[:100],
-                )
-                if use_fallback and service and service in FALLBACK_COMMITS:
-                    return [FALLBACK_COMMITS[service]]
-                return []
+                        for item in commits_data:
+                            sha = item.get("sha", "")[:7]
+                            commit_obj = item.get("commit", {})
+                            message = commit_obj.get("message", "").split("\n")[0]
+                            html_url = item.get("html_url", f"https://github.com/{owner}/{repo}/commit/{sha}")
+                            author_obj = commit_obj.get("author", {}) or item.get("author", {})
+                            author = (
+                                author_obj.get("name")
+                                or (item.get("author") or {}).get("login")
+                                or "unknown"
+                            )
 
-            commits_data = response.json()
-            if not isinstance(commits_data, list):
-                return []
+                            commit_info = CommitInfo(
+                                sha=sha,
+                                message=message,
+                                url=html_url,
+                                author=author,
+                            )
 
-            results: List[CommitInfo] = []
-            keywords = SERVICE_KEYWORDS.get(service, [service]) if service else []
+                            if service and keywords:
+                                message_lower = message.lower()
+                                if any(kw in message_lower for kw in keywords):
+                                    results.append(commit_info)
+                            else:
+                                results.append(commit_info)
 
-            for item in commits_data:
-                sha = item.get("sha", "")[:7]
-                commit_obj = item.get("commit", {})
-                message = commit_obj.get("message", "").split("\n")[0]
-                html_url = item.get("html_url", f"https://github.com/{owner}/{repo}/commit/{sha}")
-                author_obj = commit_obj.get("author", {}) or item.get("author", {})
-                author = (
-                    author_obj.get("name")
-                    or (item.get("author") or {}).get("login")
-                    or "unknown"
-                )
+                            if len(results) >= limit:
+                                break
 
-                commit_info = CommitInfo(
-                    sha=sha,
-                    message=message,
-                    url=html_url,
-                    author=author,
-                )
-
-                if service and keywords:
-                    message_lower = message.lower()
-                    if any(kw in message_lower for kw in keywords):
-                        results.append(commit_info)
+                        if results:
+                            return results
                 else:
-                    results.append(commit_info)
+                    logger.warning(
+                        "GitHub API responded with status %d: %s",
+                        response.status_code,
+                        response.text[:100],
+                    )
+        except Exception as e:
+            logger.warning("Error communicating with GitHub API: %s; using fallback if enabled", e)
 
-                if len(results) >= limit:
-                    break
+    # Graceful fallback to mock commits for the suspected service
+    if use_fallback:
+        if service and service in MOCK_COMMITS:
+            return MOCK_COMMITS[service][:limit]
+        elif not service:
+            all_commits = []
+            for comm_list in MOCK_COMMITS.values():
+                all_commits.extend(comm_list)
+            return all_commits[:limit]
 
-            if not results and service and use_fallback and service in FALLBACK_COMMITS:
-                return [FALLBACK_COMMITS[service]]
-
-            return results
-
-    except Exception as e:
-        logger.error("Error communicating with GitHub API: %s", e)
-        if use_fallback and service and service in FALLBACK_COMMITS:
-            return [FALLBACK_COMMITS[service]]
-        return []
+    return []
 
 
 def get_commit_diff(
@@ -181,8 +203,10 @@ def get_commit_diff(
     owner: Optional[str] = None,
     repo: Optional[str] = None,
     token: Optional[str] = None,
-) -> Optional[Dict[str, Any]]:
-    """Retrieve commit diff and metadata for a specific commit SHA.
+) -> Optional[str]:
+    """Retrieve commit diff text for a specific commit SHA.
+
+    CONTRACT REQUIREMENT: Returns Optional[str], NOT a dictionary.
 
     Args:
         sha: The commit SHA or prefix.
@@ -191,64 +215,40 @@ def get_commit_diff(
         token: Optional GitHub token.
 
     Returns:
-        Dictionary containing diff metadata and changed files, or None if unavailable.
+        Unified diff string text, or None / simulated diff if unavailable.
     """
     owner = owner or os.getenv("GITHUB_OWNER")
     repo = repo or os.getenv("GITHUB_REPO")
     token = token or os.getenv("GITHUB_TOKEN")
 
-    if not owner or not repo or not sha:
-        # Fallback diff simulation for offline demo
-        for s_name, fb_commit in FALLBACK_COMMITS.items():
-            if fb_commit.sha.startswith(sha) or sha.startswith(fb_commit.sha):
-                return {
-                    "sha": fb_commit.sha,
-                    "message": fb_commit.message,
-                    "author": fb_commit.author,
-                    "url": fb_commit.url,
-                    "files": [
-                        {
-                            "filename": f"services/{s_name}/config.py",
-                            "status": "modified",
-                            "additions": 14,
-                            "deletions": 5,
-                            "patch": "@@ -12,5 +12,14 @@\n- TIMEOUT = 5.0\n+ TIMEOUT = 0.8\n+ POOL_SIZE = 10",
-                        }
-                    ],
-                }
-        return None
+    if owner and repo and sha:
+        url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/commits/{sha}"
+        headers = {
+            "Accept": "application/vnd.github.v3.diff",
+            "User-Agent": "Cascade-RCA-Observability",
+        }
+        if token and token.strip():
+            headers["Authorization"] = f"Bearer {token.strip()}"
 
-    url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/commits/{sha}"
-    headers = _get_headers(token)
-
-    try:
-        with httpx.Client(timeout=4.0) as client:
-            response = client.get(url, headers=headers)
-            if response.status_code != 200:
+        try:
+            with httpx.Client(timeout=3.5) as client:
+                response = client.get(url, headers=headers)
+                if response.status_code == 200:
+                    return response.text
                 logger.warning("GitHub get_commit_diff failed with status %d", response.status_code)
-                return None
+        except Exception as e:
+            logger.warning("Failed to fetch commit diff from GitHub: %s", e)
 
-            data = response.json()
-            return {
-                "sha": data.get("sha", sha)[:7],
-                "message": (data.get("commit", {}).get("message", "")).split("\n")[0],
-                "author": (data.get("commit", {}).get("author", {}) or {}).get("name", "unknown"),
-                "url": data.get("html_url", ""),
-                "stats": data.get("stats", {}),
-                "files": [
-                    {
-                        "filename": f.get("filename"),
-                        "status": f.get("status"),
-                        "additions": f.get("additions"),
-                        "deletions": f.get("deletions"),
-                        "patch": f.get("patch", "")[:400] if f.get("patch") else None,
-                    }
-                    for f in data.get("files", [])[:5]
-                ],
-            }
-    except Exception as e:
-        logger.error("Failed to fetch commit diff from GitHub: %s", e)
-        return None
+    # Fallback diff simulation for offline demo
+    return (
+        f"--- a/services/config.py\n"
+        f"+++ b/services/config.py\n"
+        f"@@ -15,5 +15,5 @@\n"
+        f"- TIMEOUT_MS = 5000\n"
+        f"+ TIMEOUT_MS = 500\n"
+        f"- MAX_RETRIES = 3\n"
+        f"+ MAX_RETRIES = 0\n"
+    )
 
 
 def correlate_root_cause_commit(service: str) -> Optional[CommitInfo]:
