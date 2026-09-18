@@ -525,3 +525,239 @@ class TestRCAResultContract:
         result = analyze_incident(resp.incident_id, incident.telemetry)
 
         assert result.incident_id == resp.incident_id
+
+
+# ===========================================================================
+# 10. Malformed Timestamp Handling (Issue 1 regression)
+# ===========================================================================
+
+class TestMalformedTimestamps:
+    """Malformed timestamps must NOT distort RCA by appearing as earliest onset."""
+
+    def setup_method(self):
+        _reset()
+
+    def test_malformed_timestamp_does_not_become_root_cause(self):
+        """A service with a malformed timestamp must NOT be selected as root
+        cause solely because its timestamp parsed to epoch 0 / earliest."""
+        from backend.rca_engine import _parse_ts
+
+        # Valid timestamps
+        valid_ts = "2026-09-18T10:00:01+00:00"
+        # Malformed timestamp
+        bad_ts = "NOT-A-TIMESTAMP"
+
+        valid_epoch = _parse_ts(valid_ts)
+        bad_epoch = _parse_ts(bad_ts)
+
+        # Bad timestamp must NOT be earlier than valid timestamp
+        assert bad_epoch > valid_epoch, (
+            f"Malformed timestamp epoch ({bad_epoch}) should be > valid epoch ({valid_epoch}). "
+            f"Malformed timestamps must not appear as the earliest event."
+        )
+
+    def test_parse_ts_returns_inf_for_garbage(self):
+        from backend.rca_engine import _parse_ts
+        assert _parse_ts("garbage") == float("inf")
+        assert _parse_ts("") == float("inf")
+        assert _parse_ts("12345") == float("inf")
+
+    def test_parse_ts_handles_valid_iso(self):
+        from backend.rca_engine import _parse_ts
+        epoch = _parse_ts("2026-09-18T10:00:00+00:00")
+        assert epoch > 0
+        assert epoch != float("inf")
+
+    def test_parse_ts_handles_z_suffix(self):
+        from backend.rca_engine import _parse_ts
+        epoch = _parse_ts("2026-09-18T10:00:00Z")
+        assert epoch > 0
+        assert epoch != float("inf")
+
+    def test_malformed_telemetry_does_not_crash_rca(self):
+        """RCA engine must handle telemetry with bad timestamps deterministically."""
+        graph = build_service_graph()
+
+        # Create telemetry with one malformed timestamp
+        bad_event = TelemetryEvent(
+            timestamp="INVALID",
+            service="payment-service",
+            trace_id="trace-bad",
+            span_id="span-bad",
+            parent_span_id=None,
+            latency_ms=900.0,
+            status_code=500,
+        )
+        good_event = TelemetryEvent(
+            timestamp="2026-09-18T10:00:01+00:00",
+            service="order-service",
+            trace_id="trace-good",
+            span_id="span-good",
+            parent_span_id=None,
+            latency_ms=920.0,
+            status_code=500,
+        )
+
+        result = analyze_incident("INC-BADTS", telemetry=[bad_event, good_event], graph=graph)
+
+        # RCA must still produce a valid result without crashing
+        assert isinstance(result, RCAResult)
+        assert result.status == "resolved"
+        assert result.root_cause.service in ("payment-service", "order-service")
+        # Core safety invariant: the malformed timestamp must NOT have been
+        # treated as epoch 0 (earliest). Verify via cascade_info internals.
+        from backend.rca_engine import detect_cascade
+        cascade = detect_cascade([bad_event, good_event], graph)
+        stats = cascade["service_stats"]
+        bad_epoch = stats["payment-service"]["first_anomaly_epoch"]
+        good_epoch = stats["order-service"]["first_anomaly_epoch"]
+        assert bad_epoch > good_epoch, (
+            f"Malformed timestamp epoch ({bad_epoch}) must be > valid epoch ({good_epoch}). "
+            f"Malformed timestamps must not gain false temporal priority."
+        )
+
+
+# ===========================================================================
+# 11. External API Failure Resilience (Issue 4 regression)
+# ===========================================================================
+
+class TestExternalAPIResilience:
+    """RCA must produce valid results even when GitHub/Gemini throw exceptions."""
+
+    def setup_method(self):
+        _reset()
+
+    def test_rca_works_when_github_raises_exception(self):
+        """Simulate catastrophic GitHub failure — RCA must still return."""
+        import backend.rca_engine as engine
+        original_fn = engine.get_recent_commits
+
+        def _exploding_github(*args, **kwargs):
+            raise ConnectionError("GitHub is down")
+
+        engine.get_recent_commits = _exploding_github
+        try:
+            resp = simulate_payment_failure()
+            incident = get_incident(resp.incident_id)
+            result = analyze_incident(resp.incident_id, incident.telemetry)
+
+            # Core RCA decision must survive
+            assert result.root_cause.service == "payment-service"
+            assert result.root_cause.confidence >= 0.85
+            assert result.status == "resolved"
+            # commit should be null when GitHub fails
+            assert result.commit is None
+        finally:
+            engine.get_recent_commits = original_fn
+
+    def test_rca_works_when_gemini_raises_exception(self):
+        """Simulate catastrophic Gemini failure — RCA must still return."""
+        import backend.rca_engine as engine
+        original_fn = engine.generate_explanation
+
+        def _exploding_gemini(*args, **kwargs):
+            raise ConnectionError("Gemini is down")
+
+        engine.generate_explanation = _exploding_gemini
+        try:
+            resp = simulate_payment_failure()
+            incident = get_incident(resp.incident_id)
+            result = analyze_incident(resp.incident_id, incident.telemetry)
+
+            # Core RCA decision must survive
+            assert result.root_cause.service == "payment-service"
+            assert result.root_cause.confidence >= 0.85
+            assert result.status == "resolved"
+            # Explanation must still exist (inline deterministic fallback)
+            assert len(result.explanation) > 0
+        finally:
+            engine.generate_explanation = original_fn
+
+    def test_rca_works_when_both_external_apis_fail(self):
+        """Both GitHub and Gemini fail — RCA core decision is unaffected."""
+        import backend.rca_engine as engine
+        orig_github = engine.get_recent_commits
+        orig_gemini = engine.generate_explanation
+
+        engine.get_recent_commits = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("down"))
+        engine.generate_explanation = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("down"))
+        try:
+            resp = simulate_payment_failure()
+            incident = get_incident(resp.incident_id)
+            result = analyze_incident(resp.incident_id, incident.telemetry)
+
+            assert result.root_cause.service == "payment-service"
+            assert result.commit is None
+            assert len(result.explanation) > 0
+        finally:
+            engine.get_recent_commits = orig_github
+            engine.generate_explanation = orig_gemini
+
+
+# ===========================================================================
+# 12. Payment + Database Dual Injection (Issue 5 additional scenario)
+# ===========================================================================
+
+class TestPaymentAndDatabaseDualInjection:
+    """Two failures on the same checkout path: payment + database."""
+
+    def setup_method(self):
+        _reset()
+
+    def test_payment_then_database_root_cause_is_database(self):
+        """When both payment and database fail, database should be root cause
+        since it is further upstream in the dependency chain.
+
+        Note: confidence may be lower than single-scenario cases because
+        overlapping cascades produce mixed temporal signals (payment-service
+        already failing from the payment scenario before database injection).
+        """
+        resp1 = simulate_payment_failure()
+        simulate_database_latency(incident_id=resp1.incident_id)
+        incident = get_incident(resp1.incident_id)
+        result = analyze_incident(resp1.incident_id, incident.telemetry)
+
+        assert result.root_cause.service == "database"
+        assert result.root_cause.confidence > 0.0  # Must have positive confidence
+
+    def test_payment_then_database_affected_chain(self):
+        resp1 = simulate_payment_failure()
+        simulate_database_latency(incident_id=resp1.incident_id)
+        incident = get_incident(resp1.incident_id)
+        result = analyze_incident(resp1.incident_id, incident.telemetry)
+
+        assert "payment-service" in result.affected_services
+        assert "order-service" in result.affected_services
+        assert "api-gateway" in result.affected_services
+
+
+# ===========================================================================
+# 13. Confidence Score Properties (Issue 2 additional verification)
+# ===========================================================================
+
+class TestConfidenceScoreProperties:
+    """Verify confidence score properties required by architecture."""
+
+    def setup_method(self):
+        _reset()
+
+    def test_confidence_is_deterministic(self):
+        """Same input must produce same confidence every time."""
+        resp = simulate_payment_failure()
+        incident = get_incident(resp.incident_id)
+
+        r1 = analyze_incident(resp.incident_id, incident.telemetry)
+        r2 = analyze_incident(resp.incident_id, incident.telemetry)
+
+        assert r1.root_cause.confidence == r2.root_cause.confidence
+
+    def test_confidence_within_bounds(self):
+        """All scenarios must produce confidence in [0.0, 1.0]."""
+        for sim_fn in [simulate_payment_failure, simulate_database_latency, simulate_notification_failure]:
+            _reset()
+            resp = sim_fn()
+            incident = get_incident(resp.incident_id)
+            result = analyze_incident(resp.incident_id, incident.telemetry)
+            assert 0.0 <= result.root_cause.confidence <= 1.0, (
+                f"Confidence {result.root_cause.confidence} out of bounds for {sim_fn.__name__}"
+            )

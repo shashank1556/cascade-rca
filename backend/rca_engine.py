@@ -47,13 +47,20 @@ def build_service_graph() -> nx.DiGraph:
 
 
 def _parse_ts(ts_str: str) -> float:
-    """Parse ISO timestamp to POSIX epoch float for temporal comparison."""
+    """Parse ISO timestamp to POSIX epoch float for temporal comparison.
+
+    Returns float('inf') on failure so malformed timestamps are treated as
+    'unknown / latest' rather than epoch-0 which would falsely appear earliest
+    and distort causal priority.
+    """
     try:
         # Handle Z and ISO formats
         clean_ts = ts_str.replace("Z", "+00:00")
         return datetime.fromisoformat(clean_ts).timestamp()
     except Exception:
-        return 0.0
+        # SAFETY: returning inf ensures malformed timestamps never rank as
+        # earliest onset, preventing incorrect root-cause selection.
+        return float("inf")
 
 
 def detect_cascade(
@@ -236,6 +243,11 @@ def calculate_causal_score(
 ) -> float:
     """Calculate deterministic causal score for a candidate root-cause service.
 
+    Returns a PROTOTYPE CONFIDENCE SCORE between 0.0 and 1.0.
+    This is NOT a statistically calibrated probability. It is a deterministic
+    composite score derived from graph-based causal evidence for demo/prototype
+    purposes.
+
     Evidence considered:
     1. Temporal priority (onset timestamp)
     2. Dependency position (callee origin vs downstream caller)
@@ -310,12 +322,13 @@ def calculate_causal_score(
         reach_fraction = len(reachable_callers) / total_downstream
         reach_score = 0.5 + 0.5 * reach_fraction
 
-    # 4. Composite Confidence Score
+    # 4. Composite Confidence Score (PROTOTYPE — not a calibrated probability)
     raw_score = (0.40 * origin_score) + (0.35 * temporal_score) + (0.25 * reach_score)
 
-    # Calibrate prototype confidence bounds
+    # Prototype calibration: deterministic bounds for demo scenarios.
+    # These values are intentional prototype design, not statistical claims.
     if origin_score == 1.0 and temporal_score == 1.0:
-        # Primary root causes (payment failure, database latency)
+        # Strong root-cause signal (e.g., payment failure, database latency)
         if len(comp_services) >= 3:
             confidence = 0.91 + 0.03 * (reach_score - 0.5)
         else:
@@ -425,10 +438,17 @@ def analyze_incident(
         timeline_events.append(TimelineEvent(timestamp=ts, service=s, event=event_desc))
 
     # 6. Retrieve relevant GitHub commit
-    commits = get_recent_commits(primary_service)
-    matched_commit: Optional[CommitInfo] = commits[0] if commits else None
+    # Defensive: GitHub failure must never prevent RCA result delivery.
+    matched_commit: Optional[CommitInfo] = None
+    try:
+        commits = get_recent_commits(primary_service)
+        matched_commit = commits[0] if commits else None
+    except Exception:
+        # GitHub unavailable — commit remains null per contract.
+        matched_commit = None
 
     # 7. Generate human-readable explanation via Gemini (with deterministic fallback)
+    # Defensive: Gemini failure must never prevent RCA result delivery.
     evidence_payload = {
         "incident_id": incident_id,
         "root_cause": {"service": primary_service, "confidence": primary_confidence},
@@ -437,7 +457,15 @@ def analyze_incident(
         "commit": matched_commit.model_dump() if matched_commit else None,
         "independent_failures": independent_failures,
     }
-    explanation_text = generate_explanation(evidence_payload)
+    try:
+        explanation_text = generate_explanation(evidence_payload)
+    except Exception:
+        # Gemini completely unavailable — use inline deterministic fallback.
+        explanation_text = (
+            f"Root cause analysis identified {primary_service} as the likely origin "
+            f"with {primary_confidence:.0%} prototype confidence. "
+            f"Affected services: {', '.join(affected_services) if affected_services else 'none'}."
+        )
 
     return RCAResult(
         incident_id=incident_id,
