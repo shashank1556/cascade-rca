@@ -133,19 +133,12 @@ def test_get_commit_diff_success_mock():
 
 
 def test_get_commit_diff_fallback_offline():
-    """Test diff fallback for offline demo returns diff string."""
+    """Offline GitHub diff retrieval returns None rather than fake data."""
     diff = get_commit_diff("a8f3b1c")
-    assert diff is not None
-    assert isinstance(diff, str)
-    assert "--- a/services/config.py" in diff
+    assert diff is None
 
 
 def test_correlate_root_cause_commit():
-    """Test single commit correlation helper."""
+    """No relevant real commit must return None."""
     commit = correlate_root_cause_commit("payment-service")
-    assert commit is not None
-    assert isinstance(commit, CommitInfo)
-    assert commit.sha != ""
-
-    unknown = correlate_root_cause_commit("")
-    assert unknown is None
+    assert commit is None
