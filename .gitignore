@@ -40,3 +40,8 @@ ENV/
 .idea/
 *.swp
 *.swo
+
+# Node / Frontend
+node_modules/
+dist/
+
