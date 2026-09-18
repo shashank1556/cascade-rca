@@ -89,11 +89,12 @@ class TelemetryStore:
                 self._incident_counter += 1
 
             if failure_type not in self._active_failures:
-                # Maintain at most two simultaneous active failures
+                # Maintain at most two simultaneous active failures; reject third
                 if len(self._active_failures) >= 2:
-                    # Drop the oldest to retain up to two simultaneous failures
-                    removed = self._active_failures.pop(0)
-                    self._failure_start_times.pop(removed, None)
+                    raise RuntimeError(
+                        f"Cannot inject '{failure_type}': maximum of two simultaneous failures already active "
+                        f"({', '.join(self._active_failures)}). Clear or reset active failures before injecting a third."
+                    )
                 self._active_failures.append(failure_type)
                 self._failure_start_times[failure_type] = datetime.now(timezone.utc)
 
@@ -125,13 +126,9 @@ class TelemetryStore:
 store = TelemetryStore()
 
 
-def _generate_checkout_trace(
-    base_time: datetime,
-    is_payment_failed: bool = False,
-    is_db_latency: bool = False,
-) -> List[TelemetryEvent]:
-    """Generate a distributed trace for the checkout flow:
-    api-gateway -> order-service -> payment-service -> database
+def _generate_payment_failure_trace(base_time: datetime) -> List[TelemetryEvent]:
+    """Generate a distributed trace for Scenario 1: payment-service failure cascade.
+    payment-service (root cause) -> order-service -> api-gateway. Database remains healthy.
     """
     from datetime import timedelta
 
@@ -143,167 +140,215 @@ def _generate_checkout_trace(
     span_pay = store.next_span_id("payment-service")
     span_db = store.next_span_id("database")
 
-    if is_payment_failed:
-        # Scenario 1: payment-service fails at T0, order-service fails at T0+150ms, api-gateway fails at T0+300ms
-        t_pay = base_time
-        t_ord = base_time + timedelta(milliseconds=150)
-        t_gw = base_time + timedelta(milliseconds=300)
-        t_db = base_time - timedelta(milliseconds=50)
+    t_pay = base_time
+    t_ord = base_time + timedelta(milliseconds=150)
+    t_gw = base_time + timedelta(milliseconds=300)
+    t_db = base_time - timedelta(milliseconds=50)
 
-        # Database call succeeded before payment failure logic
-        events.append(
-            TelemetryEvent(
-                timestamp=_format_timestamp(t_db),
-                service="database",
-                trace_id=trace_id,
-                span_id=span_db,
-                parent_span_id=span_pay,
-                latency_ms=25.0,
-                status_code=200,
-            )
+    # Database call succeeded before payment failure logic
+    events.append(
+        TelemetryEvent(
+            timestamp=_format_timestamp(t_db),
+            service="database",
+            trace_id=trace_id,
+            span_id=span_db,
+            parent_span_id=span_pay,
+            latency_ms=25.0,
+            status_code=200,
         )
-        # Root cause: payment-service fails
-        events.append(
-            TelemetryEvent(
-                timestamp=_format_timestamp(t_pay),
-                service="payment-service",
-                trace_id=trace_id,
-                span_id=span_pay,
-                parent_span_id=span_ord,
-                latency_ms=850.0,
-                status_code=500,
-            )
+    )
+    # Root cause: payment-service fails
+    events.append(
+        TelemetryEvent(
+            timestamp=_format_timestamp(t_pay),
+            service="payment-service",
+            trace_id=trace_id,
+            span_id=span_pay,
+            parent_span_id=span_ord,
+            latency_ms=850.0,
+            status_code=500,
         )
-        # Cascade to order-service
-        events.append(
-            TelemetryEvent(
-                timestamp=_format_timestamp(t_ord),
-                service="order-service",
-                trace_id=trace_id,
-                span_id=span_ord,
-                parent_span_id=span_gw,
-                latency_ms=950.0,
-                status_code=500,
-            )
+    )
+    # Cascade to order-service
+    events.append(
+        TelemetryEvent(
+            timestamp=_format_timestamp(t_ord),
+            service="order-service",
+            trace_id=trace_id,
+            span_id=span_ord,
+            parent_span_id=span_gw,
+            latency_ms=950.0,
+            status_code=500,
         )
-        # Cascade to api-gateway
-        events.append(
-            TelemetryEvent(
-                timestamp=_format_timestamp(t_gw),
-                service="api-gateway",
-                trace_id=trace_id,
-                span_id=span_gw,
-                parent_span_id=None,
-                latency_ms=1100.0,
-                status_code=502,
-            )
+    )
+    # Cascade to api-gateway
+    events.append(
+        TelemetryEvent(
+            timestamp=_format_timestamp(t_gw),
+            service="api-gateway",
+            trace_id=trace_id,
+            span_id=span_gw,
+            parent_span_id=None,
+            latency_ms=1100.0,
+            status_code=502,
         )
-
-    elif is_db_latency:
-        # Scenario 2: database latency spikes at T0, cascading timeouts to payment, order, api-gateway
-        t_db = base_time
-        t_pay = base_time + timedelta(milliseconds=100)
-        t_ord = base_time + timedelta(milliseconds=200)
-        t_gw = base_time + timedelta(milliseconds=300)
-
-        # Origin: database latency
-        events.append(
-            TelemetryEvent(
-                timestamp=_format_timestamp(t_db),
-                service="database",
-                trace_id=trace_id,
-                span_id=span_db,
-                parent_span_id=span_pay,
-                latency_ms=3200.0,
-                status_code=504,
-            )
-        )
-        # Cascade to payment-service timeout
-        events.append(
-            TelemetryEvent(
-                timestamp=_format_timestamp(t_pay),
-                service="payment-service",
-                trace_id=trace_id,
-                span_id=span_pay,
-                parent_span_id=span_ord,
-                latency_ms=3400.0,
-                status_code=504,
-            )
-        )
-        # Cascade to order-service timeout
-        events.append(
-            TelemetryEvent(
-                timestamp=_format_timestamp(t_ord),
-                service="order-service",
-                trace_id=trace_id,
-                span_id=span_ord,
-                parent_span_id=span_gw,
-                latency_ms=3500.0,
-                status_code=504,
-            )
-        )
-        # Cascade to api-gateway timeout
-        events.append(
-            TelemetryEvent(
-                timestamp=_format_timestamp(t_gw),
-                service="api-gateway",
-                trace_id=trace_id,
-                span_id=span_gw,
-                parent_span_id=None,
-                latency_ms=3600.0,
-                status_code=504,
-            )
-        )
-
-    else:
-        # Healthy checkout flow
-        t0 = base_time
-        events.append(
-            TelemetryEvent(
-                timestamp=_format_timestamp(t0 + timedelta(milliseconds=10)),
-                service="database",
-                trace_id=trace_id,
-                span_id=span_db,
-                parent_span_id=span_pay,
-                latency_ms=12.0,
-                status_code=200,
-            )
-        )
-        events.append(
-            TelemetryEvent(
-                timestamp=_format_timestamp(t0 + timedelta(milliseconds=20)),
-                service="payment-service",
-                trace_id=trace_id,
-                span_id=span_pay,
-                parent_span_id=span_ord,
-                latency_ms=25.0,
-                status_code=200,
-            )
-        )
-        events.append(
-            TelemetryEvent(
-                timestamp=_format_timestamp(t0 + timedelta(milliseconds=35)),
-                service="order-service",
-                trace_id=trace_id,
-                span_id=span_ord,
-                parent_span_id=span_gw,
-                latency_ms=40.0,
-                status_code=200,
-            )
-        )
-        events.append(
-            TelemetryEvent(
-                timestamp=_format_timestamp(t0 + timedelta(milliseconds=50)),
-                service="api-gateway",
-                trace_id=trace_id,
-                span_id=span_gw,
-                parent_span_id=None,
-                latency_ms=55.0,
-                status_code=200,
-            )
-        )
-
+    )
     return events
+
+
+def _generate_db_latency_trace(base_time: datetime) -> List[TelemetryEvent]:
+    """Generate a distributed trace for Scenario 2: database latency cascade.
+    database (origin) -> payment-service -> order-service -> api-gateway.
+    """
+    from datetime import timedelta
+
+    trace_id = store.next_trace_id()
+    events: List[TelemetryEvent] = []
+
+    span_gw = store.next_span_id("api-gateway")
+    span_ord = store.next_span_id("order-service")
+    span_pay = store.next_span_id("payment-service")
+    span_db = store.next_span_id("database")
+
+    t_db = base_time
+    t_pay = base_time + timedelta(milliseconds=100)
+    t_ord = base_time + timedelta(milliseconds=200)
+    t_gw = base_time + timedelta(milliseconds=300)
+
+    # Origin: database latency
+    events.append(
+        TelemetryEvent(
+            timestamp=_format_timestamp(t_db),
+            service="database",
+            trace_id=trace_id,
+            span_id=span_db,
+            parent_span_id=span_pay,
+            latency_ms=3200.0,
+            status_code=504,
+        )
+    )
+    # Cascade to payment-service timeout
+    events.append(
+        TelemetryEvent(
+            timestamp=_format_timestamp(t_pay),
+            service="payment-service",
+            trace_id=trace_id,
+            span_id=span_pay,
+            parent_span_id=span_ord,
+            latency_ms=3400.0,
+            status_code=504,
+        )
+    )
+    # Cascade to order-service timeout
+    events.append(
+        TelemetryEvent(
+            timestamp=_format_timestamp(t_ord),
+            service="order-service",
+            trace_id=trace_id,
+            span_id=span_ord,
+            parent_span_id=span_gw,
+            latency_ms=3500.0,
+            status_code=504,
+        )
+    )
+    # Cascade to api-gateway timeout
+    events.append(
+        TelemetryEvent(
+            timestamp=_format_timestamp(t_gw),
+            service="api-gateway",
+            trace_id=trace_id,
+            span_id=span_gw,
+            parent_span_id=None,
+            latency_ms=3600.0,
+            status_code=504,
+        )
+    )
+    return events
+
+
+def _generate_healthy_checkout_trace(base_time: datetime) -> List[TelemetryEvent]:
+    """Generate a healthy checkout trace: api-gateway -> order-service -> payment-service -> database."""
+    from datetime import timedelta
+
+    trace_id = store.next_trace_id()
+    events: List[TelemetryEvent] = []
+
+    span_gw = store.next_span_id("api-gateway")
+    span_ord = store.next_span_id("order-service")
+    span_pay = store.next_span_id("payment-service")
+    span_db = store.next_span_id("database")
+
+    events.append(
+        TelemetryEvent(
+            timestamp=_format_timestamp(base_time + timedelta(milliseconds=10)),
+            service="database",
+            trace_id=trace_id,
+            span_id=span_db,
+            parent_span_id=span_pay,
+            latency_ms=12.0,
+            status_code=200,
+        )
+    )
+    events.append(
+        TelemetryEvent(
+            timestamp=_format_timestamp(base_time + timedelta(milliseconds=20)),
+            service="payment-service",
+            trace_id=trace_id,
+            span_id=span_pay,
+            parent_span_id=span_ord,
+            latency_ms=25.0,
+            status_code=200,
+        )
+    )
+    events.append(
+        TelemetryEvent(
+            timestamp=_format_timestamp(base_time + timedelta(milliseconds=35)),
+            service="order-service",
+            trace_id=trace_id,
+            span_id=span_ord,
+            parent_span_id=span_gw,
+            latency_ms=40.0,
+            status_code=200,
+        )
+    )
+    events.append(
+        TelemetryEvent(
+            timestamp=_format_timestamp(base_time + timedelta(milliseconds=50)),
+            service="api-gateway",
+            trace_id=trace_id,
+            span_id=span_gw,
+            parent_span_id=None,
+            latency_ms=55.0,
+            status_code=200,
+        )
+    )
+    return events
+
+
+def _generate_checkout_trace(
+    base_time: datetime,
+    is_payment_failed: bool = False,
+    is_db_latency: bool = False,
+) -> List[TelemetryEvent]:
+    """Generate distributed trace(s) for the checkout flow:
+    api-gateway -> order-service -> payment-service -> database
+
+    If BOTH is_payment_failed and is_db_latency are True, generates and returns
+    BOTH traces so that evidence for both failure modes is preserved and represented.
+    """
+    from datetime import timedelta
+
+    if is_payment_failed and is_db_latency:
+        events: List[TelemetryEvent] = []
+        events.extend(_generate_payment_failure_trace(base_time))
+        events.extend(_generate_db_latency_trace(base_time + timedelta(milliseconds=50)))
+        return events
+    elif is_payment_failed:
+        return _generate_payment_failure_trace(base_time)
+    elif is_db_latency:
+        return _generate_db_latency_trace(base_time)
+    else:
+        return _generate_healthy_checkout_trace(base_time)
 
 
 def _generate_notification_trace(
@@ -515,12 +560,21 @@ def generate_telemetry(
             trace_id = store.next_trace_id()
             span_id = store.next_span_id(service)
             status_code = 500 if is_failed and service != "api-gateway" else (502 if is_failed else 200)
-            if has_db_latency and service in ("database", "payment-service", "order-service", "api-gateway"):
+            if has_db_latency and has_payment_failure and service in ("payment-service", "order-service", "api-gateway"):
+                if i % 2 == 0:
+                    status_code = 504
+                    latency = 3200.0 + (i * 10)
+                else:
+                    status_code = 500 if service != "api-gateway" else 502
+                    latency = 850.0 if service == "payment-service" else (950.0 if service == "order-service" else 1100.0)
+            elif has_db_latency and service in ("database", "payment-service", "order-service", "api-gateway"):
                 status_code = 504
                 latency = 3200.0 + (i * 10)
             elif is_failed:
-                latency = 850.0
+                status_code = 500 if service != "api-gateway" else 502
+                latency = 850.0 if service == "payment-service" else (950.0 if service == "order-service" else 1100.0)
             else:
+                status_code = 200
                 latency = 25.0
 
             new_events.append(
