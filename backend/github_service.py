@@ -194,7 +194,6 @@ def _get_headers(token: Optional[str] = None) -> Dict[str, str]:
 # ---------------------------------------------------------------------------
 # RECENT COMMITS
 # ---------------------------------------------------------------------------
-
 def get_recent_commits(
     service: Optional[str] = None,
     limit: int = 10,
@@ -203,31 +202,19 @@ def get_recent_commits(
     token: Optional[str] = None,
     use_fallback: bool = True,
 ) -> List[CommitInfo]:
-    """Retrieve recent commits from GitHub.
+    """Retrieve recent real GitHub commits and correlate them to a service.
 
-    Behavior:
+    A commit is considered relevant when either:
+    1. Its commit message contains a service keyword, OR
+    2. One of its changed file paths contains a service-specific keyword.
 
-    1. If GitHub is configured and reachable:
-       - Fetch real commits.
-       - If a service is supplied, return ONLY commits relevant
-         to that service.
-       - If there are no relevant commits, return [].
-       - NEVER replace unrelated real commits with fake commits.
-
-    2. If GitHub is unavailable/unconfigured and use_fallback=True:
-       - Return curated fallback commits.
-
-    This prevents unrelated real commits from being presented as
-    evidence for a root cause.
+    If GitHub successfully responds but no relevant commit exists, return [].
+    Fallback data is used only when GitHub is unavailable/unconfigured/failed.
     """
 
     owner = owner or os.getenv("GITHUB_OWNER")
     repo = repo or os.getenv("GITHUB_REPO")
     token = token or os.getenv("GITHUB_TOKEN")
-
-    # ------------------------------------------------------------------
-    # REAL GITHUB API
-    # ------------------------------------------------------------------
 
     if owner and repo:
         url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/commits"
@@ -239,100 +226,192 @@ def get_recent_commits(
                     url,
                     headers=headers,
                     params={
-                        "per_page": min(max(limit, 1) * 2, 30)
+                       "per_page": min(max(limit, 1) * 2, 30),
+                       "sha": os.getenv("GITHUB_BRANCH", "shashank-rca"),
                     },
                 )
 
-            if response.status_code == 200:
-                commits_data = response.json()
+                if response.status_code == 200:
+                    commits_data = response.json()
 
-                if isinstance(commits_data, list):
-                    commits: List[CommitInfo] = []
+                    if isinstance(commits_data, list):
+                        commits: List[CommitInfo] = []
 
-                    for item in commits_data:
-                        sha = item.get("sha", "")[:7]
+                        for item in commits_data:
+                            sha_full = item.get("sha", "")
+                            sha = sha_full[:7]
 
-                        commit_obj = item.get("commit", {}) or {}
+                            commit_obj = item.get("commit", {}) or {}
 
-                        message = (
-                            commit_obj.get("message", "")
-                            .splitlines()[0]
-                            .strip()
-                        )
-
-                        html_url = item.get(
-                            "html_url",
-                            (
-                                f"https://github.com/"
-                                f"{owner}/{repo}/commit/{sha}"
-                            ),
-                        )
-
-                        author_obj = (
-                            commit_obj.get("author", {})
-                            or item.get("author", {})
-                            or {}
-                        )
-
-                        author = (
-                            author_obj.get("name")
-                            or (item.get("author") or {}).get("login")
-                            or "unknown"
-                        )
-
-                        commits.append(
-                            CommitInfo(
-                                sha=sha,
-                                message=message,
-                                url=html_url,
-                                author=author,
-                            )
-                        )
-
-                    # --------------------------------------------------
-                    # SERVICE-SPECIFIC FILTERING
-                    # --------------------------------------------------
-
-                    if service:
-                        keywords = SERVICE_KEYWORDS.get(
-                            service,
-                            [service],
-                        )
-
-                        def relevance(commit: CommitInfo) -> int:
-                            message_lower = commit.message.lower()
-
-                            return sum(
-                                1
-                                for keyword in keywords
-                                if keyword.lower() in message_lower
+                            message = (
+                                commit_obj.get("message", "")
+                                .splitlines()[0]
+                                .strip()
                             )
 
-                        relevant_commits = [
-                            commit
-                            for commit in commits
-                            if relevance(commit) > 0
-                        ]
+                            html_url = item.get(
+                                "html_url",
+                                f"https://github.com/{owner}/{repo}/commit/{sha_full}",
+                            )
 
-                        relevant_commits.sort(
-                            key=relevance,
-                            reverse=True,
-                        )
+                            author_obj = (
+                                commit_obj.get("author", {})
+                                or item.get("author", {})
+                                or {}
+                            )
 
-                        # IMPORTANT:
-                        # GitHub worked successfully, but there is no
-                        # relevant commit. Return [] rather than fake data.
-                        return relevant_commits[:limit]
+                            author = (
+                                author_obj.get("name")
+                                or (item.get("author") or {}).get("login")
+                                or "unknown"
+                            )
 
-                    # No service filter requested.
-                    return commits[:limit]
+                            commits.append(
+                                CommitInfo(
+                                    sha=sha,
+                                    message=message,
+                                    url=html_url,
+                                    author=author,
+                                )
+                            )
 
-            else:
-                logger.warning(
-                    "GitHub API responded with status %d: %s",
-                    response.status_code,
-                    response.text[:300],
-                )
+                        # --------------------------------------------------
+                        # SERVICE-SPECIFIC RELEVANCE
+                        # --------------------------------------------------
+
+                        if service:
+                            keywords = SERVICE_KEYWORDS.get(
+                                service,
+                                [service],
+                            )
+
+                            def message_relevance(commit: CommitInfo) -> int:
+                                message_lower = commit.message.lower()
+
+                                return sum(
+                                    1
+                                    for keyword in keywords
+                                    if keyword.lower() in message_lower
+                                )
+
+                            # First filter by commit message.
+                            message_matches = [
+                                commit
+                                for commit in commits
+                                if message_relevance(commit) > 0
+                            ]
+
+                            # --------------------------------------------------
+                            # FILE-PATH CORRELATION
+                            # --------------------------------------------------
+                            #
+                            # A generic commit such as:
+                            #     "Create contracts.py"
+                            #
+                            # must NOT be treated as a payment change merely
+                            # because it is in backend/.
+                            #
+                            # We therefore inspect the actual files changed
+                            # by each commit and look for service-specific
+                            # path tokens.
+                            #
+
+                            path_matches: List[tuple[int, CommitInfo]] = []
+
+                            for commit in commits:
+                                try:
+                                    detail_url = (
+                                        f"{GITHUB_API_BASE}/repos/"
+                                        f"{owner}/{repo}/commits/{commit.sha}"
+                                    )
+
+                                    detail_response = client.get(
+                                        detail_url,
+                                        headers=headers,
+                                    )
+
+                                    if detail_response.status_code != 200:
+                                        continue
+
+                                    detail_data = detail_response.json()
+                                    changed_files = detail_data.get("files", [])
+
+                                    path_score = 0
+
+                                    for changed_file in changed_files:
+                                        filename = str(
+                                            changed_file.get("filename", "")
+                                        ).lower()
+
+                                        for keyword in keywords:
+                                            keyword_lower = keyword.lower()
+
+                                            # Normalize common service naming:
+                                            # payment-service -> payment
+                                            # notification-service -> notification
+                                            # etc.
+                                            service_token = keyword_lower.replace(
+                                                "-service", ""
+                                            )
+
+                                            if service_token and service_token in filename:
+                                                path_score += 1
+
+                                    if path_score > 0:
+                                        path_matches.append(
+                                            (path_score, commit)
+                                        )
+
+                                except Exception as exc:
+                                    logger.warning(
+                                        "Failed to inspect GitHub commit %s: %s",
+                                        commit.sha,
+                                        exc,
+                                    )
+
+                            # --------------------------------------------------
+                            # COMBINE MESSAGE + FILE-PATH EVIDENCE
+                            # --------------------------------------------------
+
+                            relevant: Dict[str, tuple[int, CommitInfo]] = {}
+
+                            for commit in message_matches:
+                                score = 10 + message_relevance(commit)
+                                relevant[commit.sha] = (score, commit)
+
+                            for path_score, commit in path_matches:
+                                score = 20 + path_score
+
+                                existing = relevant.get(commit.sha)
+
+                                if existing:
+                                    score = max(score, existing[0])
+
+                                relevant[commit.sha] = (score, commit)
+
+                            ranked = sorted(
+                                relevant.values(),
+                                key=lambda item: item[0],
+                                reverse=True,
+                            )
+
+                            # IMPORTANT:
+                            # If GitHub worked successfully but no genuinely
+                            # relevant commit exists, return [].
+                            return [
+                                commit
+                                for _, commit in ranked[:limit]
+                            ]
+
+                        # No service filter requested.
+                        return commits[:limit]
+
+                else:
+                    logger.warning(
+                        "GitHub API responded with status %d: %s",
+                        response.status_code,
+                        response.text[:300],
+                    )
 
         except Exception as exc:
             logger.warning(
@@ -340,12 +419,12 @@ def get_recent_commits(
                 exc,
             )
 
-    # ------------------------------------------------------------------
+    # --------------------------------------------------
     # FALLBACK
-    # ------------------------------------------------------------------
-    # This section is reached only when GitHub is unavailable,
-    # unconfigured, or failed.
+    # --------------------------------------------------
 
+    # Only use fallback when GitHub is unavailable,
+    # unconfigured, or failed.
     if use_fallback:
         if service and service in MOCK_COMMITS:
             return MOCK_COMMITS[service][:limit]
@@ -359,7 +438,6 @@ def get_recent_commits(
             return all_commits[:limit]
 
     return []
-
 
 # ---------------------------------------------------------------------------
 # COMMIT DIFF

@@ -21,6 +21,7 @@ import {
   resetSimulation,
   getGraph,
   checkBackendHealth,
+  getRCAResult
 } from './api';
 
 export const App: React.FC = () => {
@@ -330,6 +331,9 @@ export const App: React.FC = () => {
     try {
       const response = await simulatePaymentFailure();
       setIncidentId(response.incident_id);
+
+      const rcaResult = await getRCAResult(response.incident_id);
+      setRca(rcaResult);
     } catch (error: unknown) {
       setErrorMessage(
         error instanceof Error ? error.message : 'Backend unavailable'
@@ -348,6 +352,9 @@ export const App: React.FC = () => {
     try {
       const response = await simulateDatabaseLatency();
       setIncidentId(response.incident_id);
+
+      const rcaResult = await getRCAResult(response.incident_id);
+      setRca(rcaResult);
     } catch (error: unknown) {
       setErrorMessage(
         error instanceof Error ? error.message : 'Backend unavailable'
@@ -366,6 +373,9 @@ export const App: React.FC = () => {
     try {
       const response = await simulateNotificationFailure();
       setIncidentId(response.incident_id);
+
+      const rcaResult = await getRCAResult(response.incident_id);
+      setRca(rcaResult);
     } catch (error: unknown) {
       setErrorMessage(
         error instanceof Error ? error.message : 'Backend unavailable'
